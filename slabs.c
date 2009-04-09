@@ -352,9 +352,9 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
             char key_str[128];
             char val_str[128];
             int klen = 0, vlen = 0;
-            
+
             double chunk_waste_rate = 0.0;
-	    uint32_t used_chunks = slabs*perslab - p->sl_curr - p->end_page_free;
+            uint32_t used_chunks = slabs*perslab - p->sl_curr - p->end_page_free;
             if (p->size != 0 && used_chunks !=0)
             {
                 chunk_waste_rate = (100 - ((double)p->requested/(p->size * used_chunks)) * 100.0f);

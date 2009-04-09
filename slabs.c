@@ -352,17 +352,24 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
             char key_str[128];
             char val_str[128];
             int klen = 0, vlen = 0;
+            
+            double chunk_waste_rate = 0.0;
+	    uint32_t used_chunks = slabs*perslab - p->sl_curr - p->end_page_free;
+            if (p->size != 0 && used_chunks !=0)
+            {
+                chunk_waste_rate = (100 - ((double)p->requested/(p->size * used_chunks)) * 100.0f);
+            }
 
             APPEND_NUM_STAT(i, "chunk_size", "%u", p->size);
             APPEND_NUM_STAT(i, "chunks_per_page", "%u", perslab);
             APPEND_NUM_STAT(i, "total_pages", "%u", slabs);
             APPEND_NUM_STAT(i, "total_chunks", "%u", slabs * perslab);
-            APPEND_NUM_STAT(i, "used_chunks", "%u",
-                            slabs*perslab - p->sl_curr - p->end_page_free);
+            APPEND_NUM_STAT(i, "used_chunks", "%u",used_chunks);
             APPEND_NUM_STAT(i, "free_chunks", "%u", p->sl_curr);
             APPEND_NUM_STAT(i, "free_chunks_end", "%u", p->end_page_free);
-            APPEND_NUM_STAT(i, "mem_requested", "%llu",
+            APPEND_NUM_STAT(i, "chunk_bytes_used", "%llu",
                             (unsigned long long)p->requested);
+            APPEND_NUM_STAT(i, "chunk_waste_rate", "%4.2f",chunk_waste_rate);
             APPEND_NUM_STAT(i, "get_hits", "%llu",
                     (unsigned long long)thread_stats.slab_stats[i].get_hits);
             APPEND_NUM_STAT(i, "cmd_set", "%llu",

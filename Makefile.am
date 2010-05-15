@@ -86,7 +86,8 @@ endif
 
 lib_LTLIBRARIES = default_engine.la \
                   example_protocol.la \
-                  stdin_term_handler.la
+                  stdin_term_handler.la \
+                  basic_engine_testsuite.la
 
 noinst_LTLIBRARIES=libmcd_util.la
 
@@ -109,6 +110,12 @@ stdin_term_handler_la_LDFLAGS= -module -dynamic
 
 example_protocol_la_SOURCES= example_protocol.c example_protocol.h
 example_protocol_la_LDFLAGS= -module -dynamic
+
+basic_engine_testsuite_la_SOURCES= basic_engine_testsuite.c
+basic_engine_testsuite_la_SOURCES += $(libmcd_util_la_SOURCES)
+basic_engine_testsuite_la_DEPENDENCIES=
+basic_engine_testsuite_la_LIBADD=
+basic_engine_testsuite_la_LDFLAGS= -module -dynamic
 
 if INCLUDE_DEFAULT_ENGINE
 memcached_SOURCES += $(default_engine_la_SOURCES)

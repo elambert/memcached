@@ -24,6 +24,9 @@
 #include "protocol_binary.h"
 
 #define TMP_TEMPLATE "/tmp/test_file.XXXXXXX"
+#define NO_UDP_PORT NULL
+#define UDP_HEADER_SIZE sizeof(struct udp_datagram_header_st)
+#define DEFAULT_NUMBER_OF_SERVER_THREADS 4
 
 enum test_return { TEST_SKIP, TEST_PASS, TEST_FAIL };
 
@@ -31,6 +34,21 @@ static pid_t server_pid;
 static in_port_t port;
 static int sock;
 static bool allow_closed_read = false;
+
+struct udp_datagram_header_st {
+  uint16_t request_id;
+  uint16_t sequence_number;
+  uint16_t num_datagrams;
+  uint16_t reserved;
+};
+
+struct udp_response_st {
+  size_t size;
+  uint16_t request_id;
+  uint16_t num_datagram;
+  uint16_t num_received;
+  struct iovec **datagrams;
+};
 
 static enum test_return cache_create_test(void)
 {
@@ -249,13 +267,17 @@ static enum test_return test_safe_strtol(void) {
 /**
  * Function to start the server and let it listen on a random port
  *
- * @param port_out where to store the TCP port number the server is
+ * @param tcp_port_out where to store the TCP port number the server is
  *                 listening on
+ * @param udp_port_out where to store the UDP port number the server is
+ *                 listening on, if this value is null the server will be
+ *                 configured to not use UDP ports
  * @param daemon set to true if you want to run the memcached server
  *               as a daemon process
  * @return the pid of the memcached server
  */
-static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
+static pid_t start_server(in_port_t *tcp_port_out, in_port_t *udp_port_out,
+                          bool daemon, int timeout) {
     char environment[80];
     snprintf(environment, sizeof(environment),
              "MEMCACHED_PORT_FILENAME=/tmp/ports.%lu", (long)getpid());
@@ -300,7 +322,7 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
         argv[arg++] = "-p";
         argv[arg++] = "-1";
         argv[arg++] = "-U";
-        argv[arg++] = "0";
+        argv[arg++] = udp_port_out ? "-1" : "0";
         /* Handle rpmbuild and the like doing this as root */
         if (getuid() == 0) {
             argv[arg++] = "-u";
@@ -330,13 +352,17 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
         assert(false);
     }
 
-    *port_out = (in_port_t)-1;
+    *tcp_port_out = (in_port_t)-1;
     char buffer[80];
     while ((fgets(buffer, sizeof(buffer), fp)) != NULL) {
         if (strncmp(buffer, "TCP INET: ", 10) == 0) {
             int32_t val;
             assert(safe_strtol(buffer + 10, &val));
-            *port_out = (in_port_t)val;
+            *tcp_port_out = (in_port_t)val;
+        } else if (udp_port_out && strncmp(buffer, "UDP INET: ", 10) == 0) {
+            int32_t val;
+            assert(safe_strtol(buffer + 10, &val));
+            *udp_port_out = (in_port_t)val;
         }
     }
     fclose(fp);
@@ -370,7 +396,7 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
 
 static enum test_return test_issue_44(void) {
     in_port_t port;
-    pid_t pid = start_server(&port, true, 15);
+    pid_t pid = start_server(&port, NO_UDP_PORT, true, 15);
     assert(kill(pid, SIGHUP) == 0);
     sleep(1);
     assert(kill(pid, SIGTERM) == 0);
@@ -378,12 +404,13 @@ static enum test_return test_issue_44(void) {
     return TEST_PASS;
 }
 
-static struct addrinfo *lookuphost(const char *hostname, in_port_t port)
+static struct addrinfo *lookuphost(const char *hostname, in_port_t port,
+                                   int protocol)
 {
     struct addrinfo *ai = 0;
     struct addrinfo hints = { .ai_family = AF_UNSPEC,
-                              .ai_protocol = IPPROTO_TCP,
-                              .ai_socktype = SOCK_STREAM };
+                              .ai_protocol = protocol,
+                              .ai_socktype = protocol == IPPROTO_UDP ? SOCK_DGRAM : SOCK_STREAM };
     char service[NI_MAXSERV];
     int error;
 
@@ -399,9 +426,10 @@ static struct addrinfo *lookuphost(const char *hostname, in_port_t port)
     return ai;
 }
 
-static int connect_server(const char *hostname, in_port_t port, bool nonblock)
+static int connect_server_with_protocol(const char *hostname, in_port_t port,
+                             int protocol, bool nonblock)
 {
-    struct addrinfo *ai = lookuphost(hostname, port);
+    struct addrinfo *ai = lookuphost(hostname, port, protocol);
     int sock = -1;
     if (ai != NULL) {
        if ((sock = socket(ai->ai_family, ai->ai_socktype,
@@ -427,6 +455,16 @@ static int connect_server(const char *hostname, in_port_t port, bool nonblock)
        freeaddrinfo(ai);
     }
     return sock;
+}
+
+static int connect_server(const char *hostname, in_port_t port, bool nonblock)
+{
+    return connect_server_with_protocol(hostname, port, IPPROTO_TCP, nonblock);
+}
+
+static int connect_server_udp(const char *hostname, in_port_t port, bool nonblock)
+{
+    return connect_server_with_protocol(hostname, port, IPPROTO_UDP, nonblock);
 }
 
 static enum test_return test_vperror(void) {
@@ -588,7 +626,7 @@ static enum test_return test_issue_102(void) {
 }
 
 static enum test_return start_memcached_server(void) {
-    server_pid = start_server(&port, false, 600);
+    server_pid = start_server(&port, NO_UDP_PORT, false, 600);
     sock = connect_server("127.0.0.1", port, false);
     return TEST_PASS;
 }
@@ -599,7 +637,7 @@ static enum test_return stop_memcached_server(void) {
     return TEST_PASS;
 }
 
-static void safe_send(const void* buf, size_t len, bool hickup)
+static void socket_safe_send(int socket, const void* buf, size_t len, bool hickup)
 {
     off_t offset = 0;
     const char* ptr = buf;
@@ -626,7 +664,7 @@ static void safe_send(const void* buf, size_t len, bool hickup)
             }
         }
 
-        ssize_t nw = write(sock, ptr + offset, num_bytes);
+        ssize_t nw = write(socket, ptr + offset, num_bytes);
         if (nw == -1) {
             if (errno != EINTR) {
                 fprintf(stderr, "Failed to write: %s\n", strerror(errno));
@@ -639,6 +677,26 @@ static void safe_send(const void* buf, size_t len, bool hickup)
             offset += nw;
         }
     } while (offset < len);
+}
+
+static void safe_send(const void *buf, size_t len, bool hickup) {
+    socket_safe_send(sock, buf, len, hickup);
+}
+
+static void send_udp_message(int socket, const char* buf, size_t len,
+                             uint16_t req) {
+    struct udp_datagram_header_st header = {
+      .request_id = htons(req),
+      .num_datagrams = htons(1),
+      .sequence_number = 0,
+      .reserved = 0
+    };
+    char *new_buf = malloc(len + UDP_HEADER_SIZE);
+    assert(new_buf);
+    memcpy(new_buf, &header, UDP_HEADER_SIZE);
+    memcpy(new_buf + UDP_HEADER_SIZE, buf, len);
+    socket_safe_send(socket, new_buf, len + UDP_HEADER_SIZE, false);
+    free(new_buf);
 }
 
 static bool safe_recv(void *buf, size_t len) {
@@ -700,6 +758,94 @@ static bool safe_recv_packet(void *buf, size_t size) {
     fprintf(stderr, "\n");
 #endif
     return true;
+}
+
+static void recv_udp_response(int socket, struct udp_response_st *resp) {
+    size_t max_udp_dg_size = 1400 + UDP_HEADER_SIZE;
+
+    while (resp->num_received == 0 || resp->num_received < resp->num_datagram) {
+
+        //allocate a buffer for the read
+        char *buffer = malloc(max_udp_dg_size);
+        assert(buffer);
+
+        //read the current datagram
+        ssize_t nr = read(socket, buffer, max_udp_dg_size);
+        if (nr == -1) {
+            if (errno != EINTR) {
+                fprintf(stderr, "Failed to read: %s\n", strerror(errno));
+                abort();
+            }
+        }
+
+        //is it the one I am looking for
+        assert (nr > UDP_HEADER_SIZE);
+        uint16_t recv_req_id = buffer[0] * 256 + buffer[1];
+        uint16_t segment_number = buffer[2] * 256 + buffer[3];
+        uint16_t num_datagrams = buffer[4] * 256 + buffer[5];
+        assert(resp->request_id == recv_req_id);
+
+        //sanity check
+        assert(num_datagrams != 0);
+        assert(segment_number < num_datagrams);
+
+        //if this is the first reponse,set up the response structure
+        if (resp->num_datagram == 0) {
+            resp->num_datagram = num_datagrams;
+            resp->datagrams = calloc(num_datagrams, sizeof(struct iovec));
+            assert(resp->datagrams);
+        } else {
+            //sanity check that the number of datagrams that make up the message
+            //has not changed midstream
+            assert (num_datagrams == resp->num_datagram);
+        }
+
+        //is this a duplicate?
+        if (resp->datagrams[segment_number] != NULL) {
+          free(buffer);
+          continue;
+        }
+
+        //put the data in the correct iovec
+        resp->datagrams[segment_number] = (struct iovec *)malloc(sizeof(struct iovec));
+        assert(resp->datagrams[segment_number]);
+        resp->datagrams[segment_number]->iov_len = nr;
+        resp->datagrams[segment_number]->iov_base = buffer;
+        resp->num_received++;
+        resp->size += nr;
+    }
+}
+
+static void free_upd_response(struct udp_response_st *resp) {
+    uint16_t i = 0;
+    while (i < resp->num_datagram) {
+        free(resp->datagrams[i++]);
+    }
+    free(resp->datagrams);
+}
+
+//combines the set of iovecs that make up the upd packet into a single buffer
+static char *construct_udp_message(struct udp_response_st *resp) {
+    char *resp_buff = malloc(resp->size);
+    assert(resp_buff);
+    off_t offset = 0;
+    uint16_t i = 0;
+    while (i < resp->num_datagram) {
+        struct iovec *cur_iov = resp->datagrams[i++];
+        assert(cur_iov);
+        memcpy(resp_buff + offset,cur_iov->iov_base, cur_iov->iov_len);
+        offset += cur_iov->iov_len;
+    }
+    return resp_buff;
+}
+
+//strips the header from a udp packet and returns it as a string
+static char *get_udp_payload_as_str(struct udp_response_st *resp) {
+    char *udp_packet = construct_udp_message(resp);
+    memmove(udp_packet, udp_packet + UDP_HEADER_SIZE,
+            resp->size - UDP_HEADER_SIZE);
+    udp_packet[resp->size - UDP_HEADER_SIZE] = '\0';
+    return udp_packet;
 }
 
 static off_t storage_command(char*buf,
@@ -1718,7 +1864,7 @@ static enum test_return test_issue_101(void) {
     const char *command = "stats\r\nstats\r\nstats\r\nstats\r\nstats\r\n";
     size_t cmdlen = strlen(command);
 
-    server_pid = start_server(&port, false, 1000);
+    server_pid = start_server(&port, NO_UDP_PORT, false, 1000);
 
     for (ii = 0; ii < max; ++ii) {
         fds[ii] = connect_server("127.0.0.1", port, true);
@@ -1773,6 +1919,56 @@ static enum test_return test_issue_101(void) {
     return ret;
 }
 
+// This test checks for a condition where when an improperly formated command
+// was sent via UDP, the server-side thread which serviced that connection
+// would not correctly "close" the connection and as such the theread would not
+// accept any new connections. We check this by sending a single malformed
+// message for each server side thread (the server round-robins the threads for
+// handling udp connections), then via udp we send a version request, if we
+// receive a proper response back from the version request we know the server
+// correctly dealt with the malformed request.
+static enum test_return test_issue_158(void) {
+
+    // set up
+    enum test_return ret = TEST_FAIL;
+    in_port_t port;
+    in_port_t udp_port;
+    char msg[1200];
+    char expected_reply[1200];
+    memset(msg,'a',1200);
+    uint16_t curr_udp_msg = 0;
+    const char *version_req = "version\r\n";
+    struct udp_response_st version_resp;
+    snprintf(expected_reply, 1200, "VERSION %s\r\n", VERSION);
+
+    // start server with udp enabled
+    pid_t pid = start_server(&port, &udp_port, true, 15);
+    assert(udp_port > 0);
+    int udp_socket = connect_server_udp("127.0.0.1", udp_port, false);
+
+    // send an invalid udp request for each udp connection in server
+    while (curr_udp_msg++ < DEFAULT_NUMBER_OF_SERVER_THREADS) {
+        send_udp_message(udp_socket, msg, 1200, curr_udp_msg);
+    }
+
+    // check to see if I can still talk to the server
+    send_udp_message(udp_socket, version_req, strlen(version_req), curr_udp_msg);
+    memset(&version_resp, 0, sizeof(struct udp_response_st));
+    version_resp.request_id = curr_udp_msg;
+    recv_udp_response(udp_socket, &version_resp);
+    char *version_resp_str = get_udp_payload_as_str(&version_resp);
+    if (strncmp(expected_reply, version_resp_str,
+           sizeof(strlen(expected_reply))) == 0) {
+        ret = TEST_PASS;
+    }
+
+    //clean up
+    free(version_resp_str);
+    free_upd_response(&version_resp);
+    assert(kill(pid, SIGTERM) == 0);
+    return ret;
+}
+
 typedef enum test_return (*TEST_FUNC)(void);
 struct testcase {
     const char *description;
@@ -1793,6 +1989,7 @@ struct testcase testcases[] = {
     { "issue_44", test_issue_44 },
     { "vperror", test_vperror },
     { "issue_101", test_issue_101 },
+    { "issue_158", test_issue_158 },
     /* The following tests all run towards the same server */
     { "start_server", start_memcached_server },
     { "issue_92", test_issue_92 },

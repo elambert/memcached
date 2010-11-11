@@ -3704,10 +3704,13 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_closing:
-            if (IS_UDP(c->transport))
+            if (IS_UDP(c->transport)) {
                 conn_cleanup(c);
-            else
+                c->rbytes = 0;
+                conn_set_state(c, conn_read);
+            } else {
                 conn_close(c);
+            }
             stop = true;
             break;
 
